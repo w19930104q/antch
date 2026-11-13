@@ -1,10 +1,10 @@
 package antch
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -64,6 +64,17 @@ type Crawler struct {
 	pipeHandler PipelineHandler
 	mids        []Middleware
 	pipes       []Pipeline
+
+	// baseCtx is canceled once when Exit closes; every request context
+	// is derived from it so in-flight HTTP exchanges stop on shutdown
+	// without spawning a watcher goroutine per request.
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+
+	// spiderIdleTimeout overrides the default idle lifetime of a site
+	// spider when positive. It is used to keep reclamation deterministic
+	// while the public configuration surface stays unchanged.
+	spiderIdleTimeout time.Duration
 
 	spider   map[string]*spider
 	spiderMu sync.Mutex
@@ -298,6 +309,15 @@ func (c *Crawler) requestTimeout() time.Duration {
 }
 
 func (c *Crawler) init() {
+	c.baseCtx, c.baseCancel = context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-c.Exit:
+			c.baseCancel()
+		case <-c.baseCtx.Done():
+		}
+	}()
+
 	c.client = &http.Client{
 		Transport:     c.transport(),
 		CheckRedirect: c.CheckRedirect,
@@ -317,38 +337,77 @@ func (c *Crawler) scanRequestWork(workCh chan chan *http.Request, closeCh chan i
 		workCh <- reqch
 		select {
 		case req := <-reqch:
-			resc := make(chan responseAndError)
-			spider := c.getSpider(req.URL)
-
-			if req.Header.Get("User-Agent") == "" && c.UserAgent != "" {
-				req.Header.Set("User-Agent", c.UserAgent)
-			}
-
-			spider.reqch <- requestAndChan{req: req, ch: resc}
-			select {
-			case re := <-resc:
-				closeRequest(req)
-				if re.err != nil {
-					c.logf("crawler: send HTTP request got error: %v", re.err)
-				} else {
-					go func(res *http.Response) {
-						defer closeResponse(res)
-						defer func() {
-							if r := recover(); r != nil {
-								c.logf("crawler: Handler got panic error: %v", r)
-							}
-						}()
-						h, _ := c.Handler(res)
-						h.ServeSpider(c.writeCh, res)
-					}(re.res)
-				}
-			case <-closeCh:
-				closeRequest(req)
-				return
-			}
+			c.handleRequest(req)
 		case <-closeCh:
 			return
 		}
+	}
+}
+
+// handleRequest routes a single request to its site spider and runs
+// the HTTP exchange. Keeping this in its own method guarantees the
+// per-request context is released when the iteration ends instead of
+// being retained until the worker goroutine exits.
+func (c *Crawler) handleRequest(req *http.Request) {
+	resc := make(chan responseAndError, 1)
+	spider, err := c.getSpider(req.URL)
+	if err != nil {
+		closeRequest(req)
+		c.logf("crawler: resolve site failed: %v", err)
+		return
+	}
+
+	if req.Header.Get("User-Agent") == "" && c.UserAgent != "" {
+		req.Header.Set("User-Agent", c.UserAgent)
+	}
+
+	// Derive the request context from the crawler-wide context so an
+	// in-flight HTTP exchange is canceled when Exit closes; no
+	// per-request goroutine is required. The per-request cancel releases
+	// the context's resources once this exchange is done.
+	ctx, cancel := context.WithCancel(c.baseCtx)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	// A spider may be evicted and replaced between getSpider and this
+	// send; retry with the current one so requests are never dropped and
+	// never delivered to a stopped spider.
+	for {
+		select {
+		case spider.reqch <- requestAndChan{req: req, ch: resc}:
+		case <-c.Exit:
+			closeRequest(req)
+			return
+		}
+		if spider.alive() {
+			break
+		}
+		spider, err = c.getSpider(req.URL)
+		if err != nil {
+			closeRequest(req)
+			c.logf("crawler: resolve site failed: %v", err)
+			return
+		}
+	}
+	select {
+	case re := <-resc:
+		closeRequest(req)
+		if re.err != nil {
+			c.logf("crawler: send HTTP request got error: %v", re.err)
+		} else {
+			go func(res *http.Response) {
+				defer closeResponse(res)
+				defer func() {
+					if r := recover(); r != nil {
+						c.logf("crawler: Handler got panic error: %v", r)
+					}
+				}()
+				h, _ := c.Handler(res)
+				h.ServeSpider(c.writeCh, res)
+			}(re.res)
+		}
+	case <-c.Exit:
+		closeRequest(req)
 	}
 }
 
@@ -423,15 +482,32 @@ func (c *Crawler) scanPipelineWork(workCh chan Item, closeCh chan int) {
 	}
 }
 
-// removeIdleSpider makes spider as dead.
+// defaultSpiderIdleTimeout is the time a site spider stays alive
+// without receiving any new request before it is reclaimed.
+const defaultSpiderIdleTimeout = 120 * time.Second
+
+// removeSpider unregisters the spider from the crawler. It only
+// deletes the map entry when it still points at the same spider, so a
+// freshly created replacement is never removed by an old spider that
+// is shutting down concurrently.
 func (c *Crawler) removeSpider(s *spider) {
 	c.spiderMu.Lock()
 	defer c.spiderMu.Unlock()
-	delete(c.spider, s.key)
+	if current, ok := c.spider[s.key]; ok && current == s {
+		delete(c.spider, s.key)
+	}
 }
 
-// getSpider returns a spider for the given URL.
-func (c *Crawler) getSpider(url *url.URL) *spider {
+// getSpider returns the live spider for the given URL's site. Sites are
+// isolated by normalized origin (scheme + lower-cased host + default
+// port normalization), so each site gets its own concurrency budget and
+// download delay queue.
+func (c *Crawler) getSpider(u *url.URL) (*spider, error) {
+	key, err := siteKey(u)
+	if err != nil {
+		return nil, err
+	}
+
 	c.spiderMu.Lock()
 	defer c.spiderMu.Unlock()
 
@@ -439,20 +515,63 @@ func (c *Crawler) getSpider(url *url.URL) *spider {
 		c.spider = make(map[string]*spider)
 	}
 
-	host, _, _ := net.SplitHostPort(url.Host)
-	key := fmt.Sprintf("%s%s", url.Scheme, host)
-	s, ok := c.spider[key]
-	if !ok {
-		s = &spider{
-			c:           c,
-			reqch:       make(chan requestAndChan),
-			key:         key,
-			idleTimeout: 120 * time.Second,
-		}
-		c.spider[key] = s
-		go s.crawlLoop()
+	if s, ok := c.spider[key]; ok {
+		return s, nil
 	}
-	return s
+	s := &spider{
+		c:           c,
+		reqch:       make(chan requestAndChan),
+		key:         key,
+		idleTimeout: c.spiderIdleTimeoutValue(),
+		closeCh:     make(chan struct{}),
+	}
+	c.spider[key] = s
+	go s.crawlLoop()
+	return s, nil
+}
+
+func (c *Crawler) spiderIdleTimeoutValue() time.Duration {
+	if c.spiderIdleTimeout > 0 {
+		return c.spiderIdleTimeout
+	}
+	return defaultSpiderIdleTimeout
+}
+
+// siteKey builds the normalized origin key for a site:
+// scheme://host:port with the host lower-cased, default ports for the
+// scheme normalized and IPv6 hosts unwrapped from brackets. URLs
+// without an explicit port therefore share the key of the equivalent
+// default-port URL instead of collapsing onto an empty host.
+func siteKey(u *url.URL) (string, error) {
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "", errors.New("crawler: URL without host")
+	}
+	port := u.Port()
+	if p := defaultPort(scheme); p != "" {
+		if port == "" || port == p {
+			port = p
+		}
+	}
+	if strings.Contains(host, ":") {
+		// IPv6 literal: keep the brackets in the rendered key.
+		host = "[" + host + "]"
+	}
+	if port == "" {
+		return scheme + "://" + host, nil
+	}
+	return scheme + "://" + host + ":" + port, nil
+}
+
+func defaultPort(scheme string) string {
+	switch scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
 }
 
 type requestAndChan struct {
@@ -465,54 +584,105 @@ type responseAndError struct {
 	err error
 }
 
-// spider is http spider for the single site.
+// spider is http spider for the single site. One spider owns the
+// per-site worker pool, download delay queue and idle lifecycle for a
+// single normalized origin.
 type spider struct {
 	c           *Crawler
 	reqch       chan requestAndChan
 	key         string
 	idleTimeout time.Duration
+
+	closeOnce sync.Once
+	closeCh   chan struct{}
+
+	// pending counts requests that have been accepted but whose
+	// response has not been delivered yet. Eviction waits for it to
+	// drain so in-flight work and its delay queue are never killed.
+	pending sync.WaitGroup
 }
 
-func (s *spider) queueScanWorker(workCh chan chan requestAndChan, closeCh chan struct{}) {
+// alive reports whether the spider is still running.
+func (s *spider) alive() bool {
+	select {
+	case <-s.closeCh:
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *spider) shutdown() {
+	s.closeOnce.Do(func() { close(s.closeCh) })
+}
+
+func (s *spider) queueScanWorker(workCh chan chan requestAndChan) {
 	rc := make(chan requestAndChan)
 	for {
-		workCh <- rc
+		select {
+		case workCh <- rc:
+		case <-s.closeCh:
+			return
+		}
 		select {
 		case c := <-rc:
 			resp, err := s.c.client.Do(c.req)
-			select {
-			case c.ch <- responseAndError{resp, err}:
-			case <-closeCh:
-				return
-			}
-		case <-closeCh:
+			// c.ch is buffered, so this never blocks after eviction or
+			// shutdown and the worker can always exit cleanly.
+			c.ch <- responseAndError{resp, err}
+		case <-s.closeCh:
 			return
 		}
 	}
 }
 
 func (s *spider) crawlLoop() {
-	closeCh := make(chan struct{})
 	idleTimer := time.NewTimer(s.idleTimeout)
+	defer idleTimer.Stop()
 	workCh := make(chan chan requestAndChan, s.c.maxConcurrentRequestsPerSite())
 
 	for i := 0; i < s.c.maxConcurrentRequestsPerSite(); i++ {
-		go func() {
-			s.queueScanWorker(workCh, closeCh)
-		}()
+		go s.queueScanWorker(workCh)
 	}
 
 	for {
 		select {
 		case rc := <-s.reqch:
-			// Wait a moment time before start fetching.
+			s.pending.Add(1)
+			// Wait a moment before start fetching. The delay is per
+			// site and stays interruptible by eviction or shutdown.
 			if t := s.c.downloadDelay(); t > 0 {
-				<-time.After(t)
+				select {
+				case <-time.After(t):
+				case <-s.c.Exit:
+					s.pending.Done()
+					goto exit
+				case <-s.closeCh:
+					s.pending.Done()
+					goto exit
+				}
 			}
 			go func(rc requestAndChan) {
-				c := <-workCh
-				c <- rc
+				defer s.pending.Done()
+				var c chan requestAndChan
+				select {
+				case c = <-workCh:
+				case <-s.closeCh:
+					return
+				}
+				select {
+				case c <- rc:
+				case <-s.closeCh:
+				}
 			}(rc)
+			// Push the idle deadline out; drain a stale tick first so
+			// an old deadline cannot fire immediately afterwards.
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
 			idleTimer.Reset(s.idleTimeout)
 		case <-idleTimer.C:
 			goto exit
@@ -522,9 +692,11 @@ func (s *spider) crawlLoop() {
 	}
 
 exit:
+	// Unregister first so no new request is routed to this spider, then
+	// wait for accepted work to finish before stopping the worker pool.
 	s.c.removeSpider(s)
-	close(closeCh)
-	idleTimer.Stop()
+	s.pending.Wait()
+	s.shutdown()
 }
 
 func closeRequest(r *http.Request) {

@@ -93,8 +93,9 @@ func TestSpiderIdleTimeout(t *testing.T) {
 	timeout := 10 * time.Millisecond
 	spider := &spider{
 		key:         "test",
-		c:           &Crawler{},
+		c:           &Crawler{Exit: make(chan struct{})},
 		idleTimeout: timeout,
+		closeCh:     make(chan struct{}),
 	}
 	done := make(chan struct{})
 	var (
